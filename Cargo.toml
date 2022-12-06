@@ -1,7 +1,14 @@
 [package]
 name = "privpay-cli"
 version = "0.1.0"
+license = "MIT"
+homepage = "https://privatepayments.org/"
+repository = "https://github.com/private-payments/privpay-cli"
+description = "Private Payments (BIP 351) Command Line Tool"
+keywords = ["bitcoin", "privacy", "bip351"]
+categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
 edition = "2021"
+rust-version = "1.65"
 
 [[bin]]
 name = "privpay"
