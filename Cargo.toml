@@ -1,0 +1,14 @@
+[package]
+name = "privpay-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "privpay"
+path = "src/main.rs"
+
+[dependencies]
+bip351 = "0.3"
+clap = { version = "4.0", features = ["derive"] }
+dialoguer = "0.10.2"
+secstr = "0.5.1"
