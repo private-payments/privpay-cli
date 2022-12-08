@@ -9,14 +9,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
 use secstr::SecUtf8;
 
+/// Private Payments (BIP351) Helper Tool
 #[derive(Debug, Parser)]
 #[command(name = "privpay")]
 #[command(bin_name = "privpay")]
 enum Cli {
+    /// Generate payment codes, decode notifications
     Receiver {
         #[command(subcommand)]
         command: Receiver,
     },
+    /// Create notifications and stealth addresses
     Sender {
         #[command(subcommand)]
         command: Sender,
@@ -25,22 +28,24 @@ enum Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 enum Receiver {
+    /// Generate a payment code
     Code {
         #[command(flatten)]
-        account_arg: AccountArg,
+        common_args: CommonArgs,
         #[command(flatten)]
         address_types: AddressTypesArg,
     },
+    /// Generate stealth addresses from a notification payload
     Decode {
+        /// The notification payload
         notification: String,
         #[command(flatten)]
-        account_arg: AccountArg,
+        common_args: CommonArgs,
         #[command(flatten)]
         address_types: AddressTypesArg,
-        #[arg(short = 'i', default_value_t = 0)]
-        start_address_index: u64,
-        #[arg(short = 'f')]
-        last_address_index: Option<u64>,
+        #[command(flatten)]
+        address_range: AddressRangeArgs,
+        /// Show the private key for each generated address
         #[arg(short = 'P', default_value_t = false)]
         show_private_key: bool,
     },
@@ -48,46 +53,54 @@ enum Receiver {
 
 #[derive(Debug, Clone, Subcommand)]
 enum Sender {
-    Address {
-        #[command(flatten)]
-        account_arg: AccountArg,
-        #[arg(short = 'r')]
-        recipient_index: u32,
-        #[command(flatten)]
-        address_type: AddressTypeArg,
-        recipient_payment_code: String,
-        #[arg(short = 'i', default_value_t = 0)]
-        start_address_index: u64,
-        #[arg(short = 'f')]
-        last_address_index: Option<u64>,
-    },
+    /// Generate a notification payload and stealth addresses
     Notify {
         #[command(flatten)]
-        account_arg: AccountArg,
+        common_args: CommonArgs,
+        /// Recipient index should be uniqe per recipient
         #[arg(short = 'r')]
         recipient_index: u32,
         #[command(flatten)]
         address_type: AddressTypeArg,
+        /// Payment code of the recipient
         recipient_payment_code: String,
+        #[command(flatten)]
+        address_range: AddressRangeArgs,
     },
 }
 
 #[derive(Debug, Clone, Args)]
-struct AccountArg {
+struct CommonArgs {
+    /// Which BIP32 account to use (m/351'/0'/x')
     #[arg(short, long, default_value_t = 0)]
     account: u32,
+    /// Output results as JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Args)]
 struct AddressTypeArg {
+    /// The address type committed to with this notification
     #[arg(short = 't', value_enum, rename_all = "lower", default_value_t = AddressType::default())]
     address_type: AddressType,
 }
 
 #[derive(Debug, Clone, Args)]
 struct AddressTypesArg {
+    /// Supported address types for receiving
     #[arg(short = 't', rename_all = "lower", default_values_t = vec![AddressType::default()])]
     address_types: Vec<AddressType>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct AddressRangeArgs {
+    /// First stealth address index
+    #[arg(short = 'i', default_value_t = 0)]
+    start_address_index: u64,
+    /// Last stealth address index
+    #[arg(short = 'f')]
+    last_address_index: Option<u64>,
 }
 
 impl Cli {
@@ -105,7 +118,7 @@ impl Receiver {
 
         match self {
             Receiver::Code {
-                account_arg: AccountArg { account },
+                common_args: CommonArgs { account, json },
                 address_types: AddressTypesArg { address_types },
             } => {
                 let seed = get_seed_hex()?;
@@ -121,17 +134,44 @@ impl Receiver {
                     accepted_addresses,
                 )?;
 
-                Ok(format!("{}", recipient.payment_code()).into())
+                let payment_code = recipient.payment_code();
+
+                let output = if json {
+                    let address_types: Vec<String> = payment_code
+                        .address_types()
+                        .iter()
+                        .map(|&a| AddressType::from(a).to_string())
+                        .collect();
+                    json::object! {
+                        payment_code: payment_code.to_string(),
+                        account: account,
+                        bip32_path: format!("m/351'/0'/{}'", account),
+                        address_types: address_types,
+                    }
+                    .into()
+                } else {
+                    payment_code.to_string().into()
+                };
+
+                Ok(output)
             }
             Receiver::Decode {
                 notification,
-                account_arg: AccountArg { account },
+                common_args: CommonArgs { account, json },
                 address_types: AddressTypesArg { address_types },
-                start_address_index,
-                last_address_index,
+                address_range:
+                    AddressRangeArgs {
+                        start_address_index,
+                        last_address_index,
+                    },
                 show_private_key,
             } => {
-                let script = Script::from_hex(&notification)?;
+                let bytes: Vec<u8> = FromHex::from_hex(&notification)?;
+                let script = if bytes.starts_with(b"PP") {
+                    Script::new_op_return(&bytes)
+                } else {
+                    Script::from(bytes)
+                };
 
                 let seed = get_seed_hex()?;
 
@@ -148,21 +188,59 @@ impl Receiver {
 
                 if let Some(commitment) = recipient.detect_notification(&secp, &script) {
                     let range = index_range(start_address_index, last_address_index);
+                    let output_capacity =
+                        range.end().saturating_add(1).saturating_sub(*range.start()) as usize;
 
-                    let mut lines: Vec<String> = Vec::with_capacity(
-                        range.end().saturating_add(1).saturating_sub(*range.start()) as usize,
-                    );
-                    for i in range {
-                        let (address, public_key, private_key) =
-                            recipient.key_info(&secp, &commitment, i)?;
-                        if show_private_key {
-                            lines.push(format!("{i}: {address} {public_key} {private_key}"));
-                        } else {
-                            lines.push(format!("{i}: {address}"));
+                    if json {
+                        let mut addresses: Vec<json::JsonValue> =
+                            Vec::with_capacity(output_capacity);
+                        for c in range {
+                            let (address, public_key, private_key) =
+                                recipient.key_info(&secp, &commitment, c)?;
+                            if show_private_key {
+                                addresses.push(json::object! {
+                                    address: address.to_string(),
+                                    index: c,
+                                    public_key: public_key.to_string(),
+                                    private_key: private_key.to_string(),
+                                });
+                            } else {
+                                addresses.push(json::object! {
+                                    address: address.to_string(),
+                                    index: c,
+                                });
+                            }
                         }
-                    }
 
-                    return Ok(Output::Plain(lines.join("\n")));
+                        let output = json::object! {
+                            receiver: json::object! {
+                                payment_code: recipient.payment_code().to_string(),
+                                account: account,
+                                bip32_path: format!("m/351'/0'/{}'", account),
+                            },
+                            notification: json::object!{
+                                scriptpubkey: script.to_hex(),
+                                payload: script.to_bytes()[2..].to_hex(),
+                                asm: script.asm(),
+                            },
+                            addresses: addresses,
+                        };
+
+                        return Ok(output.into());
+                    } else {
+                        let mut lines: Vec<String> = Vec::with_capacity(output_capacity);
+                        for c in range {
+                            let (address, public_key, private_key) =
+                                recipient.key_info(&secp, &commitment, c)?;
+                            if show_private_key {
+                                lines.push(format!("{c}: {address} {public_key} {private_key}"));
+                            } else {
+                                lines.push(format!("{c}: {address}"));
+                            }
+                        }
+
+                        return Ok(Output::Plain(lines.join("\n")));
+                    }
                 }
 
                 Ok(Output::Empty)
@@ -176,53 +254,70 @@ impl Sender {
         let secp = bitcoin::secp256k1::Secp256k1::new();
 
         match self {
-            Sender::Address {
-                account_arg,
+            Sender::Notify {
+                common_args: CommonArgs { account, json },
                 recipient_index,
                 address_type: AddressTypeArg { address_type },
                 recipient_payment_code,
-                start_address_index,
-                last_address_index,
+                address_range:
+                    AddressRangeArgs {
+                        start_address_index,
+                        last_address_index,
+                    },
             } => {
                 let recipient = bip351::PaymentCode::from_str(&recipient_payment_code)?;
 
                 let seed = get_seed_hex()?;
 
-                let AccountArg { account } = account_arg;
                 let sender = bip351::Sender::from_seed(&secp, &seed, Network::Bitcoin, account)?;
 
-                let (_, commitment) =
+                let (txout, commitment) =
                     sender.notify(&secp, &recipient, recipient_index, address_type.into())?;
 
                 let range = index_range(start_address_index, last_address_index);
+                let output_capacity =
+                    range.end().saturating_add(1).saturating_sub(*range.start()) as usize;
 
-                let mut lines: Vec<String> = Vec::with_capacity(
-                    range.end().saturating_add(1).saturating_sub(*range.start()) as usize,
-                );
-                for i in range {
-                    let address = sender.address(&secp, &commitment, i)?;
-                    lines.push(format!("{i}: {address}"));
+                if json {
+                    let mut addresses: Vec<json::JsonValue> = Vec::with_capacity(output_capacity);
+                    for c in range {
+                        let address = sender.address(&secp, &commitment, c)?;
+                        addresses.push(json::object! {
+                            address: address.to_string(),
+                            index: c,
+                        });
+                    }
+
+                    let output = json::object! {
+                        receiver: json::object!{
+                            payment_code: recipient_payment_code,
+                            index: recipient_index,
+                        },
+                        sender: json::object!{
+                            account: account,
+                            bip32_path: format!("m/351'/0'/{}'", account),
+                        },
+                        notification: json::object!{
+                            scriptpubkey: txout.script_pubkey.to_hex(),
+                            payload: txout.script_pubkey.to_bytes()[2..].to_hex(),
+                            asm: txout.script_pubkey.asm(),
+                        },
+                        addresses: addresses,
+                    };
+
+                    Ok(output.into())
+                } else {
+                    let mut lines: Vec<String> =
+                        Vec::with_capacity(output_capacity.saturating_add(1));
+
+                    lines.push(txout.script_pubkey.asm());
+                    for c in range {
+                        let address = sender.address(&secp, &commitment, c)?;
+                        lines.push(format!("{c}: {address}"));
+                    }
+
+                    Ok(Output::Plain(lines.join("\n")))
                 }
-
-                Ok(Output::Plain(lines.join("\n")))
-            }
-            Sender::Notify {
-                account_arg,
-                recipient_index,
-                address_type: AddressTypeArg { address_type },
-                recipient_payment_code,
-            } => {
-                let recipient = bip351::PaymentCode::from_str(&recipient_payment_code)?;
-
-                let seed = get_seed_hex()?;
-
-                let AccountArg { account } = account_arg;
-                let sender = bip351::Sender::from_seed(&secp, &seed, Network::Bitcoin, account)?;
-
-                let (txout, _) =
-                    sender.notify(&secp, &recipient, recipient_index, address_type.into())?;
-
-                Ok(txout.script_pubkey.as_bytes().to_hex().into())
             }
         }
     }
@@ -259,6 +354,16 @@ impl From<AddressType> for bip351::AddressType {
     }
 }
 
+impl From<bip351::AddressType> for AddressType {
+    fn from(t: bip351::AddressType) -> Self {
+        match t {
+            bip351::AddressType::P2pkh => Self::P2pkh,
+            bip351::AddressType::P2wpkh => Self::P2wpkh,
+            bip351::AddressType::P2tr => Self::P2tr,
+        }
+    }
+}
+
 impl std::fmt::Display for AddressType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -273,13 +378,15 @@ impl std::fmt::Display for AddressType {
 
 enum Output {
     Empty,
+    Json(json::JsonValue),
     Plain(String),
 }
 
 impl Output {
-    fn print(&self) {
+    fn print(self) {
         match self {
             Self::Empty => {}
+            Self::Json(output) => println!("{}", json::stringify_pretty(output, 2)),
             Self::Plain(s) => println!("{s}"),
         }
     }
@@ -288,6 +395,12 @@ impl Output {
 impl From<String> for Output {
     fn from(s: String) -> Self {
         Output::Plain(s)
+    }
+}
+
+impl From<json::JsonValue> for Output {
+    fn from(j: json::JsonValue) -> Self {
+        Output::Json(j)
     }
 }
 
