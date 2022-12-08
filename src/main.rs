@@ -10,7 +10,19 @@ use dialoguer::Password;
 use secstr::SecUtf8;
 
 /// Private Payments (BIP351) Helper Tool
+///
+/// The Private Payments stealth address protocol works in three phases:
+///
+/// 1. The receiver generates a payment code, derived from the seed hex of their HD wallet.
+///
+/// 2. The sender generates notification information and transmits it as an OP_RETURN output in the
+/// Bitcoin blockchain or out-of-band to the receiver directly. The sender also derives stealth
+/// addresses that only the receiver may spend.
+///
+/// 3. The receiver decodes the notificaton payload and derives the same stealth addresses that
+/// the sender will use for payments. Only the receiver knows the private keys for these addresses.
 #[derive(Debug, Parser)]
+#[command(version)]
 #[command(name = "privpay")]
 #[command(bin_name = "privpay")]
 enum Cli {

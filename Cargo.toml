@@ -1,6 +1,6 @@
 [package]
 name = "privpay"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 homepage = "https://privatepayments.org/"
 repository = "https://github.com/private-payments/privpay-cli"
